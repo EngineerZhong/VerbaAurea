@@ -106,26 +106,46 @@ def find_split_points(elements_info, max_length, min_length,
                       min_split_score, heading_score_bonus,
                       sentence_end_score_bonus, length_score_factor,
                       debug_mode, adv_settings):
+    """
+    寻找分割点：
+      1. 遇到标题立即插分割点（若开启 force_split_before_heading）。
+      2. 标题后的【空行 + 前 cooldown 段正文/表格】全部跳过，不参与打分。
+         cooldown 数由 advanced_settings.heading_cooldown_elements 控制，默认 2。
+    """
     force_heading = adv_settings.get("force_split_before_heading", True)
+    cooldown_len  = adv_settings.get("heading_cooldown_elements", 2)
+
     split_points = []
     current_length = 0
     last_potential = -1
+    cooldown_after_heading = 0   # ← 冷却段计数器
 
     for idx, elem in enumerate(elements_info):
-        if force_heading and elem['is_heading'] and idx > 0:
-            # 只有当上一分段点不是自己才加入
+
+        # ---------- 标题：强制分段 ----------
+        if elem['is_heading'] and idx > 0 and force_heading:
             if not split_points or idx != split_points[-1]:
                 split_points.append(idx)
             current_length = 0
             last_potential = idx
+            cooldown_after_heading = cooldown_len     # ← 开启冷却
             if debug_mode:
-                preview = (elem['text'][:30] + '...') if elem['text'] else '[table]'
-                print(f"  #{idx:03d} (heading) 强制分段 «{preview}»")
+                prev = (elem['text'][:30] + '...') if elem['text'] else '[table]'
+                print(f"  #{idx:03d} (heading) 强制分段 «{prev}»")
             continue
 
+        # ---------- 空行：始终累长，绝不当候选 ----------
         if elem['length'] == 0:
+            current_length += elem['length']
             continue
 
+        # ---------- 冷却阶段：仅累长，不打分 ----------
+        if cooldown_after_heading > 0:
+            current_length += elem['length']
+            cooldown_after_heading -= 1
+            continue
+
+        # ---------- 计算得分 ----------
         current_length += elem['length']
         score = calculate_split_score(
             idx, elem, elements_info, current_length,
@@ -136,13 +156,16 @@ def find_split_points(elements_info, max_length, min_length,
         )
 
         if debug_mode:
-            preview = (elem['text'][:30] + '...') if elem['text'] else '[table]'
-            print(f"  #{idx:03d} ({elem['type']}) len={elem['length']} score={score:.1f} {preview}")
+            pv = (elem['text'][:30] + '...') if elem['text'] else '[table]'
+            print(f"  #{idx:03d} ({elem['type']}) len={elem['length']} score={score:.1f} {pv}")
 
+        # ---------- 命中分割 ----------
         if score >= min_split_score and idx > 0:
             split_points.append(idx)
             current_length = 0
             last_potential = idx
+
+        # ---------- 超长兜底 ----------
         elif current_length > max_length * 1.5:
             best = find_nearest_sentence_boundary(elements_info, idx, search_window)
             if best >= 0 and (not split_points or best > split_points[-1]):
@@ -161,74 +184,107 @@ def calculate_split_score(idx, elem, elements_info, current_length,
                           min_length, max_length, sentence_integrity_weight,
                           heading_score_bonus, sentence_end_score_bonus,
                           length_score_factor, split_points, adv_settings):
+
     score = 0
+    heading_after_penalty = adv_settings.get("heading_after_penalty", 12)
+
+    # 基础分
     if elem['type'] == 'para':
         if elem['is_heading']:
             score += heading_score_bonus
         if elem['ends_with_period']:
             score += sentence_end_score_bonus
-        # 句子边界检查（仅段落间）
+
         if idx > 0 and elements_info[idx-1]['type'] == 'para' and \
            is_sentence_boundary(elements_info[idx-1]['text'], elem['text']):
             score += sentence_integrity_weight
         else:
             score -= 10
-        # ---- 标题之后(允许夹空段)的第一段，强行减分 ----
-        prev = idx - 1
-        while prev >= 0 and elements_info[prev]['type'] == 'para' \
-                and elements_info[prev]['length'] == 0:  # 跳过空段
-            prev -= 1
-        if prev >= 0 and elements_info[prev]['is_heading']:
-            heading_after_penalty = adv_settings.get("heading_after_penalty", 12)
-            score -= heading_after_penalty  # 让评分掉到阈值以下
     else:
-        # 表格：天然边界，可在其前后分段
-        score += 6
+        score += 6          # 表格基分
+
+    # 紧跟标题统一扣分
+    prev = idx - 1
+    while prev >= 0 and elements_info[prev]['type'] == 'para' and \
+          elements_info[prev]['length'] == 0:
+        prev -= 1
+    if prev >= 0 and elements_info[prev]['is_heading']:
+        score -= heading_after_penalty
 
     # 长度因子
     if current_length >= min_length:
         score += min(4, (current_length - min_length)//length_score_factor)
-    elif current_length < min_length*0.7:
+    elif current_length < min_length * 0.7:
         score -= 5
 
-    # 避免过近
+    # 距上个分割点太近
     if split_points and idx - split_points[-1] < 3:
         score -= 8
+
+    # 超长补分
     if current_length > max_length:
         score += 4
+
     return score
 
 
 def refine_split_points(elements_info, split_points, search_window, debug_mode):
     refined = []
+
     for sp in split_points:
-        before = elements_info[sp-1]['text'] if sp>0 else ''
-        after  = elements_info[sp]['text']
-        if elements_info[sp-1]['type']=='para' and elements_info[sp]['type']=='para' and \
-           not is_sentence_boundary(before, after):
+        # 若分割点本身或紧邻标题，则完全保留
+        if elements_info[sp]['is_heading'] \
+           or (sp > 0 and elements_info[sp-1]['is_heading']):
+            refined.append(sp)
+            continue
+
+        # 仅对 “段落 ↔ 段落” 之间尝试句边界微调
+        need_adjust = False
+        if sp > 0 and \
+           elements_info[sp-1]['type'] == 'para' and \
+           elements_info[sp]['type'] == 'para':
+            need_adjust = not is_sentence_boundary(elements_info[sp-1]['text'],
+                                                   elements_info[sp]['text'])
+
+        if need_adjust:
             best = find_nearest_sentence_boundary(elements_info, sp, search_window)
-            refined.append(best if best>=0 else sp)
+            refined.append(best if best >= 0 else sp)
         else:
             refined.append(sp)
+
     return sorted(set(refined))
 
 def merge_heading_with_body(elements_info, split_points):
-    adjusted = []
+    """
+    保证“标题 + 第一块真实内容（段落或表格）”不可被拆开
+    —— 无论分割点落在空行/表格/段落，只要位于这两者之间就删除。
+    """
+    if not split_points:
+        return []
+
+    keep = set(split_points)
+
     for sp in split_points:
-        new_sp = sp
-        # 向前扫，跳过空段落
-        while new_sp > 0 and elements_info[new_sp-1]['type'] == 'para' \
-              and elements_info[new_sp-1]['length'] == 0:
-            new_sp -= 1
-        # （2）如果刚跳到的就是标题 —— OK，保持 new_sp
-        if elements_info[new_sp]['is_heading']:
-            pass
-        # （3）如果它的前一个元素是标题，则把分割点移到标题
-        elif new_sp > 0 and elements_info[new_sp - 1]['is_heading']:
-            new_sp -= 1
-        if new_sp not in adjusted:
-            adjusted.append(new_sp)
-    return sorted(adjusted)
+        # 寻找 sp 前方最近非空元素
+        i = sp - 1
+        while i >= 0 and elements_info[i]['length'] == 0:
+            i -= 1
+
+        if i >= 0 and elements_info[i]['is_heading']:
+            heading_idx = i
+
+            # 找标题后的首块非空内容
+            j = heading_idx + 1
+            while j < len(elements_info) and elements_info[j]['length'] == 0:
+                j += 1
+
+            first_content_idx = j
+
+            if heading_idx < sp <= first_content_idx:
+                keep.discard(sp)
+
+    return sorted(keep)
+
 
 
 
