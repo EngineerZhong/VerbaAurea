@@ -12,7 +12,7 @@ DEFAULT_CONFIG = {
         "table_length_factor": 1.2
     },
     "processing_options": {
-        "debug_mode": False,
+        "debug_mode": True,
         "output_folder": "输出文件夹",
         "skip_existing": True
     },

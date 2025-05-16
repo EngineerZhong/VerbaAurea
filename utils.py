@@ -10,9 +10,9 @@ import os
 import sys
 
 
-def get_script_dir():
+def get_script_dir(input):
     """获取脚本当前路径"""
-    current_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+    current_dir = os.path.dirname(input)
     if not current_dir:  # 如果为空，使用当前工作目录
         current_dir = os.getcwd()
     return current_dir

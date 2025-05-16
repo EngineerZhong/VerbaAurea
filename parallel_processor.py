@@ -11,14 +11,14 @@ import sys
 import time
 from multiprocessing import Pool, cpu_count, Manager
 from utils import get_script_dir
-
+import logging
 
 def collect_files_to_process(config):
 
     """收集需要处理的文件列表"""
     # 获取脚本当前路径
-    current_dir = get_script_dir()
-
+    current_dir = get_script_dir(config['input_folder'])
+    logging.info(f"current_dir:{current_dir}")
     # 创建输出目录
     output_folder = config["processing_options"]["output_folder"]
     output_base_dir = os.path.join(current_dir, output_folder)
@@ -132,7 +132,7 @@ def process_all_documents(config):
     # 收集需要处理的文件
     files_to_process = collect_files_to_process(config)
     total_files = len(files_to_process)
-
+    
     if total_files == 0:
         if debug_mode:
             print("没有找到需要处理的Word文档")

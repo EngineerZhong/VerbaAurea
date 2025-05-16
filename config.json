@@ -1,12 +1,12 @@
 {
   "document_settings": {
-  "max_length": 1000,
-  "min_length": 300,
-  "sentence_integrity_weight": 8.0,
-  "table_length_factor": 1.2
+    "max_length": 1000,
+    "min_length": 300,
+    "sentence_integrity_weight": 8.0,
+    "table_length_factor": 1.2
   },
   "processing_options": {
-    "debug_mode": false,
+    "debug_mode": true,
     "output_folder": "文件输出",
     "skip_existing": true
   },
